@@ -1,111 +1,231 @@
-const express = require("express");
+const Fastify = require("fastify");
 const axios = require("axios");
+const cors = require("@fastify/cors");
+const fs = require("fs");
+const path = require("path");
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const app = Fastify({ logger: false });
 
-const API_URL = "http://160.250.247.143:9000/api";
+const PORT = 3000;
+const API_URL = "https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=ee2d066f9a42e456cbd7f1ca034b88ea";
 
-// ====== CONFIG ======
-const ADMIN = "@vanminh2603";
-let history = []; // lưu 50 phiên
+const HISTORY_FILE = path.join(__dirname, "history.json");
 
-// ====== PHÂN TÍCH CẦU ======
-function analyzePattern(data) {
-    if (data.length < 5) return "random";
+let history = [];
+let cache = null;
+let lastFetch = 0;
+const CACHE_TIME = 3000;
 
-    const last = data.slice(-5).map(x => x.result);
-
-    // cầu bệt
-    if (last.every(x => x === "chan")) return "bet_chan";
-    if (last.every(x => x === "le")) return "bet_le";
-
-    // cầu 1-1
-    let zigzag = true;
-    for (let i = 1; i < last.length; i++) {
-        if (last[i] === last[i - 1]) zigzag = false;
-    }
-
-    if (zigzag) {
-        return last[last.length - 1] === "chan" ? "bet_le" : "bet_chan";
-    }
-
-    return "random";
+// ===== LOAD HISTORY =====
+if (fs.existsSync(HISTORY_FILE)) {
+  history = JSON.parse(fs.readFileSync(HISTORY_FILE));
 }
 
-// ====== AI DỰ ĐOÁN ======
-function predict(history) {
-    const pattern = analyzePattern(history);
-
-    if (pattern === "bet_chan") return "chan";
-    if (pattern === "bet_le") return "le";
-
-    // fallback random nhẹ
-    return Math.random() > 0.5 ? "chan" : "le";
+// ===== SAVE HISTORY =====
+function saveHistory() {
+  fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
 }
 
-// ====== CALL API ======
+// ===== CACHE API =====
 async function getData() {
-    try {
-        const res = await axios.get(API_URL, { timeout: 10000 });
-        return res.data;
-    } catch {
-        return null;
-    }
+  const now = Date.now();
+
+  if (cache && now - lastFetch < CACHE_TIME) {
+    return cache;
+  }
+
+  const res = await axios.get(API_URL);
+  cache = res.data;
+  lastFetch = now;
+
+  return cache;
 }
 
-// ====== API CHÍNH ======
-app.get("/api", async (req, res) => {
-    const data = await getData();
+// ===== 🧠 AI VIP =====
+function duDoan(data) {
+  const last = data.slice(0, 12).map(i => i.resultTruyenThong);
 
-    let phien = Date.now();
-    let result = Math.random() > 0.5 ? "chan" : "le";
+  let tai = last.filter(i => i === "TAI").length;
+  let xiu = last.filter(i => i === "XIU").length;
 
-    if (data) {
-        phien = data.phien || data.round || phien;
-        result = data.ket_qua || result;
+  let prediction = tai > xiu ? "TAI" : "XIU";
+
+  // ===== 🔥 BỆT =====
+  let streak = 1;
+  for (let i = 1; i < last.length; i++) {
+    if (last[i] === last[0]) streak++;
+    else break;
+  }
+
+  if (streak >= 3) {
+    prediction = last[0];
+  }
+
+  // ===== 🧠 ZIGZAG =====
+  let zigzag = true;
+  for (let i = 0; i < 6; i++) {
+    if (last[i] === last[i + 1]) {
+      zigzag = false;
+      break;
     }
+  }
+
+  if (zigzag) {
+    prediction = last[0] === "TAI" ? "XIU" : "TAI";
+  }
+
+  // ===== 📈 ĐẢO CẦU =====
+  let daoCau = false;
+  for (let i = 0; i < 6; i++) {
+    if (
+      last[i] === last[i + 1] &&
+      last[i + 2] === last[i + 3] &&
+      last[i] !== last[i + 2]
+    ) {
+      daoCau = true;
+      break;
+    }
+  }
+
+  if (daoCau) {
+    prediction = last[0] === "TAI" ? "XIU" : "TAI";
+  }
+
+  // ===== CONFIDENCE =====
+  let confidence =
+    Math.abs(tai - xiu) * 8 +
+    streak * 6 +
+    (zigzag ? 15 : 0) +
+    (daoCau ? 15 : 0);
+
+  return {
+    du_doan: prediction,
+    do_tin_cay: Math.min(confidence, 95) + "%",
+    phan_tich: {
+      tai,
+      xiu,
+      bet: streak,
+      zigzag,
+      dao_cau: daoCau
+    }
+  };
+}
+
+// ===== MIDDLEWARE =====
+app.register(cors);
+
+// ================= API FULL =================
+app.get("/api/taixiu", async () => {
+  try {
+    const res = await getData();
+    const data = res.list;
+
+    const phanTich = duDoan(data);
 
     // lưu lịch sử
-    history.push({ phien, result });
-    if (history.length > 50) history.shift();
-
-    const duDoan = predict(history);
-
-    // fake xúc xắc
-    const xucXac = [
-        Math.random() > 0.5 ? "do" : "trang",
-        Math.random() > 0.5 ? "do" : "trang",
-        Math.random() > 0.5 ? "do" : "trang"
-    ];
-
-    const soDo = xucXac.filter(x => x === "do").length;
-    const soTrang = 3 - soDo;
-
-    res.json({
-        success: true,
-        admin: ADMIN,
-        phien_hien_tai: phien,
-        du_doan: duDoan,
-        lich_su: history,
-        pattern: analyzePattern(history),
-        du_doan_xuc_xac: xucXac,
-        cua_dat:
-            soDo === 3 ? "3_do" :
-            soTrang === 3 ? "3_trang" :
-            soDo === 2 ? "2_do_1_trang" :
-            "1_do_2_trang",
-        so_do: soDo,
-        so_trang: soTrang
+    history.unshift({
+      time: new Date().toLocaleString("vi-VN"),
+      phien: data[0].id,
+      ket_qua: data[0].resultTruyenThong
     });
+
+    history = history.slice(0, 100);
+    saveHistory();
+
+    return {
+      status: "success",
+      thong_bao: "🔥 API Tài Xỉu VIP Hoạt Động",
+
+      ket_qua_moi_nhat: {
+        phien: data[0].id,
+        ket_qua: data[0].resultTruyenThong,
+        xuc_xac: data[0].dices,
+        tong: data[0].point
+      },
+
+      thong_ke: res.typeStat,
+
+      du_doan: phanTich,
+
+      lich_su: history,
+
+      doanhtung: "Văn Minh VIP – AI cầu + zigzag + đảo cầu 🔥"
+    };
+
+  } catch (err) {
+    return {
+      status: "error",
+      message: "Lỗi API",
+      doanhtung: "Văn Minh VIP"
+    };
+  }
 });
 
-// ====== ROUTE CHECK ======
-app.get("/", (req, res) => {
-    res.send("🚀 API SOI CẦU VIP RUNNING - ADM " + ADMIN);
+// ================= API MD5 =================
+app.get("/api/taixiumd5", async () => {
+  try {
+    const res = await getData();
+    const data = res.list;
+
+    const phanTich = duDoan(data);
+
+    const cau = data.slice(0, 6).map(i => i.resultTruyenThong).join("-");
+
+    let streak = 1;
+    for (let i = 1; i < data.length; i++) {
+      if (data[i].resultTruyenThong === data[0].resultTruyenThong) {
+        streak++;
+      } else break;
+    }
+
+    return {
+      status: "success",
+
+      phien: data[0].id,
+
+      ket_qua: data[0].resultTruyenThong,
+
+      chi_tiet: {
+        xuc_xac: data[0].dices,
+        tong: data[0].point
+      },
+
+      cau,
+
+      cau_bet: {
+        loai: data[0].resultTruyenThong,
+        do_dai: streak
+      },
+
+      thong_ke: res.typeStat,
+
+      du_doan: phanTich,
+
+      doanhtung: "Văn Minh MD5 VIP – AI phân tích nâng cao 🔥"
+    };
+
+  } catch (err) {
+    return {
+      status: "error",
+      message: "Lỗi API MD5",
+      doanhtung: "Văn Minh VIP"
+    };
+  }
 });
 
-// ====== START ======
-app.listen(PORT, () => {
-    console.log("🔥 Server chạy tại port " + PORT);
+// ===== TEST =====
+app.get("/", async () => {
+  return {
+    message: "🚀 Server Tài Xỉu đang chạy...",
+    api: [
+      "/api/taixiu",
+      "/api/taixiumd5"
+    ],
+    author: "Văn Minh VIP"
+  };
+});
+
+// ===== START =====
+app.listen({ port: PORT, host: "0.0.0.0" }, () => {
+  console.log("🔥 Server chạy tại http://localhost:" + PORT);
 });
